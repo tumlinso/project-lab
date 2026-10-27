@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "project-lab"
+version = "0.1.0"
+description = "Scheduled, source-bound software experiments with durable results and recovery"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp[cli]>=1.0,<2",
+  "pydantic>=2.10,<3",
+  "project-evidence>=0.1.0,<0.2",
+  "project-source>=0.1.0,<0.2",
+]
+
+[dependency-groups]
+dev = ["pytest>=9.1,<10"]
+
+[project.optional-dependencies]
+scheduler = ["device-scheduler-mcp>=0.1.0,<0.2"]
+
+[project.scripts]
+project-lab = "project_lab.cli:main"
+project-lab-worker = "project_lab.cli:worker_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/project_lab"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
