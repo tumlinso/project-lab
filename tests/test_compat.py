@@ -56,7 +56,8 @@ def test_legacy_sessions_are_visible_but_never_resumable(tmp_path, capsys):
       INSERT INTO lab_session_events VALUES('event-b','session-interrupted','cleanup_unknown','{}',4);
       INSERT INTO lab_session_events VALUES('event-other','session-other','cancelled','{}',4);
       INSERT INTO lab_session_proposals VALUES('proposal-a','session-interrupted',0,'{"step":1}',3);
-      INSERT INTO lab_session_effects VALUES('effect-a','session-interrupted','proposal-a','unknown','{}',NULL);
+      INSERT INTO lab_session_effects VALUES('effect-a','session-interrupted','proposal-a','unknown',
+        '{"measurements":["elapsed_ms"],"elapsed_ms":12}',NULL);
       INSERT INTO lab_experiments VALUES('experiment-a','demo','interrupted');
       INSERT INTO lab_candidates VALUES('candidate-a','experiment-a','abc');
       INSERT INTO lab_candidates VALUES('candidate-unrelated','experiment-orphan','def');
@@ -89,6 +90,16 @@ def test_legacy_sessions_are_visible_but_never_resumable(tmp_path, capsys):
     assert [item["id"] for item in result["effects"]] == ["effect-a"]
     assert [item["id"] for item in result["experiments"]] == ["experiment-a"]
     assert [item["id"] for item in result["candidates"]] == ["candidate-a"]
+    effect = result["effects"][0]
+    assert effect["measurements"] == {"elapsed_ms": 12}
+    assert effect["measurement_provenance"]["source"] == "legacy_receipt_json"
+    comparison = lab.compare(["session-interrupted", "session-other"], ["elapsed_ms"])
+    assert comparison["sessions"] == [
+        {"session_id": "session-interrupted", "effects": 1,
+         "measurements": {"elapsed_ms": [12]}, "inspect_only": True},
+        {"session_id": "session-other", "effects": 0,
+         "measurements": {}, "inspect_only": True},
+    ]
     assert result["coverage"]["complete"] is False
     assert result["coverage"]["omitted"]["lab_session_events"] == 1
     assert all(item["inspect_only"] is True and item["provenance"]["source_database"]

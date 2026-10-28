@@ -5,6 +5,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -537,7 +538,7 @@ class Lab:
     @staticmethod
     def _legacy_record_view(record: Mapping[str, Any], original: Mapping[str, Any]) -> dict[str, Any]:
         payload = record.get("payload", {})
-        return {
+        view = {
             "id": str(payload.get("original_id", record.get("subject", ""))),
             "state": original.get("state", payload.get("original_state")),
             "created_at": original.get("created_at"),
@@ -549,6 +550,37 @@ class Lab:
                            "source_kind": record.get("kind")},
             "original_record": dict(original),
         }
+        # Older LAB effect receipts stored metric names in a list and their
+        # values alongside the list. Normalize only those explicitly declared
+        # finite numeric metrics, while retaining the original row above.
+        if record.get("kind") == "legacy_lab_session_effects":
+            raw_receipt = original.get("receipt_json")
+            try:
+                receipt = json.loads(raw_receipt) if isinstance(raw_receipt, str) else raw_receipt
+            except (TypeError, ValueError):
+                receipt = None
+            measurements: dict[str, int | float] = {}
+            omitted: list[str] = []
+            if isinstance(receipt, Mapping):
+                declared = receipt.get("measurements", {})
+                candidates = declared.items() if isinstance(declared, Mapping) else (
+                    (name, receipt.get(name)) for name in declared
+                    if isinstance(declared, list) and isinstance(name, str)
+                ) if isinstance(declared, list) else ()
+                for name, value in candidates:
+                    if isinstance(name, str) and isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                        measurements[name] = value
+                    elif isinstance(name, str):
+                        omitted.append(name)
+            view["measurements"] = measurements
+            view["measurement_provenance"] = {
+                "source": "legacy_receipt_json",
+                "observation_id": record.get("observation_id"),
+                "declared_metric_names": list(measurements) + omitted,
+                "omitted_metrics": omitted,
+                "complete": not omitted,
+            }
+        return view
 
     def compare(self, session_ids: Sequence[str], metrics: Sequence[str] = ()) -> dict[str, Any]:
         if not 2 <= len(session_ids) <= 32:
@@ -557,14 +589,18 @@ class Lab:
         rows = []
         for result in all_results:
             effects = result["effects"]
-            receipts = [e["receipt"] for e in effects if e["receipt"]]
             measurements = {}
-            for receipt in receipts:
-                values = receipt.get("measurements", {})
+            for effect in effects:
+                receipt = effect.get("receipt")
+                values = (effect.get("measurements", {}) if result.get("inspect_only")
+                          else receipt.get("measurements", {}) if isinstance(receipt, Mapping) else {})
+                if not isinstance(values, Mapping):
+                    continue
                 for key, value in values.items():
                     if not metrics or key in metrics:
                         measurements.setdefault(key, []).append(value)
-            rows.append({"session_id": result["session_id"], "effects": len(effects), "measurements": measurements})
+            rows.append({"session_id": result["session_id"], "effects": len(effects),
+                         "measurements": measurements, **({"inspect_only": True} if result.get("inspect_only") else {})})
         return {"sessions": rows}
 
     def control(self, request: ControlRequest | Mapping[str, Any]) -> dict[str, Any]:

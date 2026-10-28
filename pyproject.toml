@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "project-lab"
-version = "0.1.1"
+version = "0.1.2"
 description = "Scheduled, source-bound software experiments with durable results and recovery"
 readme = "README.md"
 requires-python = ">=3.11"
