@@ -93,7 +93,9 @@ def test_gpu_effect_and_controller_specs_are_valid_core_jobs_with_separate_alloc
     client = RecordingSchedulerClient()
     config = tmp_path / "lab config.toml"
     state = tmp_path / "private state"
-    adapter = DeviceSchedulerAdapter(client, owner_id="lab-owner", state_dir=state, config_path=config)
+    worker = "/home/test/.local/bin/project-lab-worker"
+    adapter = DeviceSchedulerAdapter(client, owner_id="lab-owner", state_dir=state,
+                                     config_path=config, worker_executable=worker)
     adapter.submit(request={
         "project": "demo", "candidate_dir": "/tmp/lab/candidate", "source_dir": "/tmp/lab/capture",
         "argv": ["python3", "test.py"],
@@ -112,7 +114,7 @@ def test_gpu_effect_and_controller_specs_are_valid_core_jobs_with_separate_alloc
     assert controller_result["job_id"] == "job-2"
     assert isinstance(controller, JobSpec)
     assert controller.argv == (
-        "project-lab-worker", "--config", str(config), "--state-dir", str(state),
+        worker, "--config", str(config), "--state-dir", str(state),
         "--session", "session-1",
     )
     assert controller.working_directory == str(state)
@@ -123,7 +125,8 @@ def test_gpu_effect_and_controller_specs_are_valid_core_jobs_with_separate_alloc
 
 def test_adapter_wait_inspect_preserve_queued_and_terminal_cleanup_receipts() -> None:
     client = RecordingSchedulerClient()
-    adapter = DeviceSchedulerAdapter(client, owner_id="lab-owner")
+    adapter = DeviceSchedulerAdapter(client, owner_id="lab-owner",
+                                     worker_executable="/home/test/.local/bin/project-lab-worker")
     submitted = adapter.submit_controller(request={"session_id": "session-1", "run": _run()}, idempotency_key="controller")
     job_id = submitted["job_id"]
     waited = adapter.wait(job_id, 4.5)
@@ -142,9 +145,38 @@ def test_adapter_wait_inspect_preserve_queued_and_terminal_cleanup_receipts() ->
     assert final["result"]["measurements"] == {"elapsed_ms": 12}
 
 
+def test_controller_resolves_installed_worker_to_absolute_executable(tmp_path: Path, monkeypatch) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    worker = bin_dir / "project-lab-worker"
+    worker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    worker.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    client = RecordingSchedulerClient()
+    adapter = DeviceSchedulerAdapter(client, owner_id="lab-owner", state_dir=tmp_path / "state")
+
+    adapter.submit_controller(request={"session_id": "session-1", "run": _run()},
+                              idempotency_key="controller-absolute")
+    spec = client.calls[-1][1]
+    assert isinstance(spec, JobSpec)
+    assert spec.argv[0] == str(worker.resolve())
+
+
+def test_controller_fails_actionably_when_worker_cannot_be_resolved(monkeypatch) -> None:
+    monkeypatch.setenv("PATH", "")
+    client = RecordingSchedulerClient()
+    adapter = DeviceSchedulerAdapter(client, owner_id="lab-owner")
+    with pytest.raises(ValueError, match="absolute project-lab-worker executable"):
+        adapter.submit_controller(request={"session_id": "session-1", "run": _run()},
+                                  idempotency_key="controller-no-worker")
+    assert client.calls == []
+
+
 def test_delayed_schedule_emits_a_valid_not_before_job_template() -> None:
     client = RecordingSchedulerClient()
-    adapter = DeviceSchedulerAdapter(client, owner_id="lab-owner", state_dir="/tmp/lab-state")
+    worker = "/home/test/.local/bin/project-lab-worker"
+    adapter = DeviceSchedulerAdapter(client, owner_id="lab-owner", state_dir="/tmp/lab-state",
+                                     worker_executable=worker)
     start = datetime(2030, 1, 2, tzinfo=timezone.utc).timestamp()
     result = adapter.schedule(request={
         "run": _run(), "start_at": start, "recurrence_seconds": None,
@@ -154,7 +186,7 @@ def test_delayed_schedule_emits_a_valid_not_before_job_template() -> None:
     assert result["job_id"] == "job-1"
     assert isinstance(job, JobSpec)
     assert job.not_before.astimezone(timezone.utc) == datetime(2030, 1, 2, tzinfo=timezone.utc)
-    assert job.profile_id is None and job.argv[0] == "project-lab-worker"
+    assert job.profile_id is None and job.argv[0] == worker
     assert job.environment["PROJECT_LAB_CAPTURE_AT_START"] == "1"
     assert json.loads(job.environment["PROJECT_LAB_RUN_REQUEST"])["resource"]["gpu_count"] == 0
     assert all(item.kind != "gpu" for item in job.resources)
@@ -162,7 +194,9 @@ def test_delayed_schedule_emits_a_valid_not_before_job_template() -> None:
 
 def test_recurring_schedule_is_a_valid_schedule_spec_with_start_time_capture() -> None:
     client = RecordingSchedulerClient()
-    adapter = DeviceSchedulerAdapter(client, owner_id="lab-owner", state_dir="/tmp/lab-state")
+    worker = "/home/test/.local/bin/project-lab-worker"
+    adapter = DeviceSchedulerAdapter(client, owner_id="lab-owner", state_dir="/tmp/lab-state",
+                                     worker_executable=worker)
     result = adapter.schedule(request={
         "run": _run(gpu_count=1), "start_at": None, "recurrence_seconds": 3600,
         "timezone": "America/Los_Angeles", "capture_source_at_start": True,
@@ -259,7 +293,8 @@ def test_scheduler_result_measurements_flow_to_results_compare_and_next_planner_
     digest = hashlib.sha256(input_file.read_bytes()).hexdigest()
     planner = ResultAwarePlanner(digest)
     client = CoreShapedResultClient()
-    scheduler = DeviceSchedulerAdapter(client, owner_id="lab-owner", state_dir=tmp_path / "lab-state")
+    scheduler = DeviceSchedulerAdapter(client, owner_id="lab-owner", state_dir=tmp_path / "lab-state",
+                                       worker_executable="/home/test/.local/bin/project-lab-worker")
     lab = Lab(tmp_path / "lab-state", projects={"demo": Project("demo", source, "demo-repo")},
               planner=planner, scheduler=scheduler)
 

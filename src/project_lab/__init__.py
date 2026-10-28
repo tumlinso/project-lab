@@ -1,7 +1,7 @@
 """Scheduled, source-bound software experiments."""
 
 from .models import Project, RunRequest
-from .service import Lab
+from .service import Lab, LegacySessionReadOnlyError
 
-__all__ = ["Lab", "Project", "RunRequest"]
-__version__ = "0.1.0"
+__all__ = ["Lab", "LegacySessionReadOnlyError", "Project", "RunRequest"]
+__version__ = "0.1.1"

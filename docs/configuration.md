@@ -115,6 +115,7 @@ Add scheduler settings to the same TOML file to enable `run` and `schedule`:
 url = "http://127.0.0.1:8770"
 token_file = "/home/you/.config/device-scheduler/client.token"
 owner_id = "my-project-lab"
+worker_executable = "/home/you/.local/bin/project-lab-worker"
 
 [scheduler.resource_kinds]
 cpu = "cpu"
@@ -131,9 +132,12 @@ and GPU resources.
 `run` explicitly authorizes a finite session and submits a CPU/memory-only
 controller job. The controller plans without holding experiment GPU capacity;
 each proposed effect is submitted separately with the requested resources. The
-Device Scheduler execution environment must have both `project-lab-worker` and
-`codex` available on `PATH`, and the worker's configured Codex account must be
-authenticated. Install the same Project-Lab and shared-package versions there.
+Device Scheduler execution environment must have `project-lab-worker` and
+`codex` installed, and the worker's configured Codex account must be
+authenticated. Project-Lab sends an absolute worker path in controller jobs.
+Set `scheduler.worker_executable` when the scheduler cannot resolve the worker
+from its service `PATH`. Install the same Project-Lab and shared-package
+versions in that execution environment.
 The absolute config and state paths passed to the worker must exist and be
 accessible from that environment, and the state directory must be shared by
 the API process and worker so the worker can read the session journal, captured

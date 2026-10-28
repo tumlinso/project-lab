@@ -13,6 +13,19 @@ from .models import Project, RunRequest, ScheduleRequest
 from .service import Lab
 
 
+def _error_payload(exc: Exception) -> dict[str, object]:
+    error: dict[str, object] = {"error": type(exc).__name__, "message": str(exc)}
+    code = getattr(exc, "code", None)
+    if isinstance(code, str):
+        error["code"] = code
+    if getattr(exc, "inspect_only", False) is True:
+        error["inspect_only"] = True
+    session_id = getattr(exc, "session_id", None)
+    if isinstance(session_id, str):
+        error["session_id"] = session_id
+    return error
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="project-lab", description="Run and inspect bounded software experiments")
     parser.add_argument("--config", type=Path, default=Path("~/.config/project-lab/config.toml").expanduser())
@@ -60,7 +73,8 @@ def _load(path: Path, state_dir: Path | None) -> Lab:
         scheduler = DeviceSchedulerAdapter(client, owner_id=scheduler_config["owner_id"],
             resource_kinds=scheduler_config.get("resource_kinds", {}),
             controller_profile_id=scheduler_config.get("controller_profile_id", "project-lab-controller"),
-            state_dir=root, config_path=path)
+            state_dir=root, config_path=path,
+            worker_executable=scheduler_config.get("worker_executable"))
     return Lab(root, projects=projects, planner=planner, scheduler=scheduler)
 
 
@@ -103,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     except Exception as exc:
-        print(json.dumps({"error": type(exc).__name__, "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps(_error_payload(exc), ensure_ascii=False), file=sys.stderr)
         return 2
 
 
@@ -126,7 +140,7 @@ def worker_main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     except Exception as exc:
-        print(json.dumps({"error": type(exc).__name__, "message": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        print(json.dumps(_error_payload(exc), ensure_ascii=False), file=sys.stderr)
         return 2
 
 

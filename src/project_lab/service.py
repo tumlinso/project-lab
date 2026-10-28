@@ -26,6 +26,17 @@ class LabError(ValueError):
     """Invalid scope or operation against a Project-Lab record."""
 
 
+class LegacySessionReadOnlyError(LabError):
+    """A copied historical session is inspect-only and cannot be resumed."""
+
+    code = "legacy_session_inspect_only"
+    inspect_only = True
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        super().__init__(f"legacy session {session_id!r} is inspect-only; it cannot be run, resumed, or controlled")
+
+
 class CaptureIntegrityError(LabError):
     """Captured inputs no longer match their recorded identities."""
 
@@ -77,6 +88,8 @@ class Lab:
     def run(self, request: RunRequest | Mapping[str, Any] | None = None, *, session_id: str | None = None,
             _resume: bool = False) -> dict[str, Any]:
         """Authorize a finite scope and submit its durable session controller."""
+        if session_id is not None and self._legacy_session_observation(session_id) is not None:
+            raise LegacySessionReadOnlyError(session_id)
         if self.planner is None or self.scheduler is None:
             raise LabError("run requires configured Codex planner and Device Scheduler adapters")
         if not hasattr(self.scheduler, "submit_controller"):
@@ -149,6 +162,8 @@ class Lab:
 
     def drive(self, session_id: str) -> dict[str, Any]:
         """Worker entry point: reconcile existing effects, then drive to a bounded boundary."""
+        if self._legacy_session_observation(session_id) is not None:
+            raise LegacySessionReadOnlyError(session_id)
         if self.planner is None or self.scheduler is None:
             raise LabError("worker requires configured Codex planner and Device Scheduler adapters")
         db = self.journal.connect()
@@ -385,10 +400,9 @@ class Lab:
         try:
             rows = ([db.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()]
                     if session_id else db.execute("SELECT * FROM sessions ORDER BY created DESC LIMIT 100").fetchall())
-            if session_id and rows[0] is None:
-                raise LabError("session not found")
             sessions = [self._public_session(row) for row in rows if row is not None]
-            if session_id and rows[0]["controller_job_id"] and self.scheduler is not None:
+            active_exists = bool(rows and rows[0] is not None) if session_id else True
+            if session_id and active_exists and rows[0]["controller_job_id"] and self.scheduler is not None:
                 try:
                     observed = dict(self.scheduler.inspect(rows[0]["controller_job_id"]))
                     sessions[0]["scheduler_controller"] = {
@@ -401,26 +415,140 @@ class Lab:
                         "job_id": rows[0]["controller_job_id"], "state": "unavailable",
                         "reason": type(exc).__name__,
                     }
-            return {"sessions": sessions}
         finally:
             db.close()
+        if session_id:
+            if active_exists:
+                return {"sessions": sessions, "legacy_sessions": [], "legacy_sessions_complete": True}
+            legacy = self._legacy_session_observation(session_id)
+            if legacy is None:
+                raise LabError("session not found")
+            return {"sessions": [], "legacy_sessions": [self._legacy_session_view(legacy)],
+                    "legacy_sessions_complete": True}
+
+        legacy_records = self.evidence.list_observations(owner="project-lab-legacy", limit=1000)
+        legacy_sessions = [self._legacy_session_view(record) for record in legacy_records
+                           if record.get("kind") == "legacy_lab_sessions"]
+        return {"sessions": sessions, "legacy_sessions": legacy_sessions,
+                "legacy_sessions_complete": len(legacy_records) < 1000}
 
     def results(self, session_id: str, *, limit: int = 100) -> dict[str, Any]:
         if limit < 1 or limit > 1000:
             raise LabError("limit must be between 1 and 1000")
         db = self.journal.connect()
         try:
-            if db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone() is None:
-                raise LabError("session not found")
-            proposals = db.execute("SELECT id,ordinal,proposal,created FROM proposals WHERE session_id=? ORDER BY ordinal LIMIT ?", (session_id, limit)).fetchall()
-            effects = db.execute("SELECT id,proposal_id,state,scheduler_job_id,receipt,created,updated FROM effects WHERE session_id=? ORDER BY created LIMIT ?", (session_id, limit)).fetchall()
-            events = db.execute("SELECT kind,at,payload FROM events WHERE session_id=? ORDER BY id LIMIT ?", (session_id, limit)).fetchall()
-            return {"session_id": session_id,
-                    "proposals": [{**dict(p), "proposal": json.loads(p["proposal"])} for p in proposals],
-                    "effects": [{**dict(e), "receipt": json.loads(e["receipt"]) if e["receipt"] else None} for e in effects],
-                    "events": [{**dict(e), "payload": json.loads(e["payload"])} for e in events]}
+            exists = db.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone() is not None
+            if not exists:
+                proposals = effects = events = None
+            else:
+                proposals = db.execute("SELECT id,ordinal,proposal,created FROM proposals WHERE session_id=? ORDER BY ordinal LIMIT ?", (session_id, limit)).fetchall()
+                effects = db.execute("SELECT id,proposal_id,state,scheduler_job_id,receipt,created,updated FROM effects WHERE session_id=? ORDER BY created LIMIT ?", (session_id, limit)).fetchall()
+                events = db.execute("SELECT kind,at,payload FROM events WHERE session_id=? ORDER BY id LIMIT ?", (session_id, limit)).fetchall()
         finally:
             db.close()
+        if not exists:
+            return self._legacy_results(session_id, limit)
+        return {"session_id": session_id,
+                "proposals": [{**dict(p), "proposal": json.loads(p["proposal"])} for p in proposals],
+                "effects": [{**dict(e), "receipt": json.loads(e["receipt"]) if e["receipt"] else None} for e in effects],
+                "events": [{**dict(e), "payload": json.loads(e["payload"])} for e in events]}
+
+    def _legacy_session_observation(self, session_id: str) -> dict[str, Any] | None:
+        record = self.evidence.get_observation(f"legacy:lab_sessions:{session_id}")
+        if (not isinstance(record, dict) or record.get("owner") != "project-lab-legacy"
+                or record.get("kind") != "legacy_lab_sessions"):
+            return None
+        return record
+
+    @staticmethod
+    def _legacy_session_view(record: Mapping[str, Any]) -> dict[str, Any]:
+        payload = record.get("payload", {})
+        original = payload.get("original_record", {}) if isinstance(payload, Mapping) else {}
+        return {
+            "session_id": str(original.get("session_id", record.get("subject", ""))),
+            "project": original.get("project"),
+            "repository": original.get("repository"),
+            "state": original.get("state", payload.get("original_state")),
+            "created_at": original.get("created_at"),
+            "updated_at": original.get("updated_at"),
+            "record_type": "legacy",
+            "inspect_only": True,
+            "observation_id": record.get("observation_id"),
+            "source_database": payload.get("source_database"),
+        }
+
+    def _legacy_results(self, session_id: str, limit: int) -> dict[str, Any]:
+        session_record = self._legacy_session_observation(session_id)
+        if session_record is None:
+            raise LabError("session not found")
+        observations = self.evidence.list_observations(owner="project-lab-legacy", limit=1000)
+        linked: dict[str, list[dict[str, Any]]] = {
+            "lab_session_events": [], "lab_session_proposals": [],
+            "lab_session_effects": [], "lab_experiments": [], "lab_candidates": [],
+        }
+        originals: list[Mapping[str, Any]] = []
+        for record in observations:
+            payload = record.get("payload", {})
+            original = payload.get("original_record") if isinstance(payload, Mapping) else None
+            if not isinstance(original, Mapping):
+                continue
+            kind = str(record.get("kind", ""))
+            table = kind.removeprefix("legacy_")
+            if table in linked and original.get("session_id") == session_id:
+                linked[table].append(self._legacy_record_view(record, original))
+                originals.append(original)
+
+        session_payload = session_record.get("payload", {})
+        session_original = session_payload.get("original_record", {}) if isinstance(session_payload, Mapping) else {}
+        originals.insert(0, session_original)
+        experiment_ids, candidate_ids = _legacy_related_ids(originals)
+        for record in observations:
+            payload = record.get("payload", {})
+            original = payload.get("original_record") if isinstance(payload, Mapping) else None
+            if not isinstance(original, Mapping):
+                continue
+            table = str(record.get("kind", "")).removeprefix("legacy_")
+            if table == "lab_experiments" and original.get("experiment_id") in experiment_ids:
+                linked[table].append(self._legacy_record_view(record, original))
+            elif table == "lab_candidates" and (
+                    original.get("candidate_id") in candidate_ids
+                    or original.get("experiment_id") in experiment_ids):
+                linked[table].append(self._legacy_record_view(record, original))
+
+        for records in linked.values():
+            records.sort(key=lambda item: (str(item.get("created_at", "")), str(item.get("id", ""))))
+        omitted = {name: max(0, len(records) - limit) for name, records in linked.items()}
+        scan_limited = len(observations) >= 1000
+        complete = not scan_limited and not any(omitted.values())
+        return {
+            "session_id": session_id,
+            "inspect_only": True,
+            "session": self._legacy_record_view(session_record, session_original),
+            "events": linked["lab_session_events"][:limit],
+            "proposals": linked["lab_session_proposals"][:limit],
+            "effects": linked["lab_session_effects"][:limit],
+            "experiments": linked["lab_experiments"][:limit],
+            "candidates": linked["lab_candidates"][:limit],
+            "coverage": {"complete": complete, "scan_limit": 1000,
+                         "scanned_observations": len(observations),
+                         "scan_limited": scan_limited, "omitted": omitted},
+        }
+
+    @staticmethod
+    def _legacy_record_view(record: Mapping[str, Any], original: Mapping[str, Any]) -> dict[str, Any]:
+        payload = record.get("payload", {})
+        return {
+            "id": str(payload.get("original_id", record.get("subject", ""))),
+            "state": original.get("state", payload.get("original_state")),
+            "created_at": original.get("created_at"),
+            "record_type": "legacy",
+            "inspect_only": True,
+            "observation_id": record.get("observation_id"),
+            "provenance": {"source_database": payload.get("source_database"),
+                           "source_owner": record.get("owner"),
+                           "source_kind": record.get("kind")},
+            "original_record": dict(original),
+        }
 
     def compare(self, session_ids: Sequence[str], metrics: Sequence[str] = ()) -> dict[str, Any]:
         if not 2 <= len(session_ids) <= 32:
@@ -441,6 +569,8 @@ class Lab:
 
     def control(self, request: ControlRequest | Mapping[str, Any]) -> dict[str, Any]:
         req = request if isinstance(request, ControlRequest) else ControlRequest.model_validate(request)
+        if self._legacy_session_observation(req.session_id) is not None:
+            raise LegacySessionReadOnlyError(req.session_id)
         row = self._session(req.session_id)
         if req.action == "resume":
             if row["state"] not in {"paused", "running", "queued", "attention_required"}:
@@ -655,6 +785,34 @@ class Lab:
 
 def _request(request: RunRequest | Mapping[str, Any]) -> RunRequest:
     return request if isinstance(request, RunRequest) else RunRequest.model_validate(request)
+
+
+def _legacy_related_ids(records: Sequence[Mapping[str, Any]]) -> tuple[set[str], set[str]]:
+    experiment_ids: set[str] = set()
+    candidate_ids: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                if key in {"experiment_id", "experiment_ids"}:
+                    values = item if isinstance(item, (list, tuple)) else (item,)
+                    experiment_ids.update(str(entry) for entry in values if isinstance(entry, (str, int)))
+                elif key in {"candidate_id", "candidate_ids"}:
+                    values = item if isinstance(item, (list, tuple)) else (item,)
+                    candidate_ids.update(str(entry) for entry in values if isinstance(entry, (str, int)))
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+        elif isinstance(value, str) and value[:1] in {"{", "["}:
+            try:
+                visit(json.loads(value))
+            except json.JSONDecodeError:
+                pass
+
+    for record in records:
+        visit(record)
+    return experiment_ids, candidate_ids
 
 
 def _validate_proposal(raw: Mapping[str, Any], capture: Mapping[str, Any]) -> dict[str, Any]:

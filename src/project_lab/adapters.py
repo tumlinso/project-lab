@@ -7,6 +7,7 @@ import hashlib
 import math
 import os
 from pathlib import Path
+import shutil
 import subprocess
 from typing import Any, Mapping, Protocol
 
@@ -55,13 +56,24 @@ class DeviceSchedulerAdapter:
                  resource_kinds: Mapping[str, str] | None = None,
                  controller_profile_id: str = "project-lab-controller",
                  state_dir: str | Path | None = None,
-                 config_path: str | Path | None = None):
+                 config_path: str | Path | None = None,
+                 worker_executable: str | Path | None = None):
         self.client = client
         self.owner_id = owner_id
         self.controller_profile_id = controller_profile_id
         self.state_dir = str(Path(state_dir).expanduser()) if state_dir else "~/.local/state/project-lab"
         self.config_path = str(Path(config_path).expanduser()) if config_path else "~/.config/project-lab/config.toml"
+        if worker_executable is not None and not Path(worker_executable).expanduser().is_absolute():
+            raise ValueError("worker_executable must be an absolute path")
+        self.worker_executable = (str(Path(worker_executable).expanduser()) if worker_executable is not None
+                                  else shutil.which("project-lab-worker"))
         self.resource_kinds = {"cpu": "cpu", "memory": "memory", "gpu": "gpu", **dict(resource_kinds or {})}
+
+    def _worker_argv(self) -> list[str]:
+        executable = self.worker_executable or shutil.which("project-lab-worker")
+        if not executable or not Path(executable).is_absolute():
+            raise ValueError("Project-Lab controller needs an absolute project-lab-worker executable; install it on PATH or set scheduler.worker_executable")
+        return [executable]
 
     def _call(self, awaitable):
         import asyncio
@@ -105,7 +117,7 @@ class DeviceSchedulerAdapter:
             {"kind": self.resource_kinds["memory"], "quantities": {"bytes": min(int(run["resource"]["memory_mb"]), 2048) * 1024**2}},
         ]
         spec = {"owner_id": self.owner_id,
-                "argv": ["project-lab-worker", "--config", self.config_path,
+                "argv": [*self._worker_argv(), "--config", self.config_path,
                          "--state-dir", self.state_dir, "--session", request["session_id"]],
                 "working_directory": self.state_dir, "resources": resources,
                 "timeout_seconds": run["max_wall_seconds"], "max_attempts": 1,
@@ -206,7 +218,7 @@ class DeviceSchedulerAdapter:
         run = request["run"]
         interval = request.get("recurrence_seconds")
         serialized = json.dumps(run, sort_keys=True, separators=(",", ":"))
-        controller_argv = ["project-lab-worker", "--config", self.config_path,
+        controller_argv = [*self._worker_argv(), "--config", self.config_path,
                            "--state-dir", self.state_dir]
         resources = [
             {"kind": self.resource_kinds["cpu"], "quantities": {"cores": min(int(run["resource"]["cpus"]), 2)}},
